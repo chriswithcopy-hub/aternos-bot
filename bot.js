@@ -3,12 +3,32 @@ const { pathfinder, Movements, goals } = require('mineflayer-pathfinder');
 const { GoalNear, GoalGetToBlock } = goals;
 const { Vec3 } = require('vec3');
 
-// ... (Keep your existing CONFIG, HP, HOSTILE_MOBS, FOOD_ITEMS, and STATE constants)
+const config = {
+  host:     process.env.SERVER_HOST || 'tiktokbuddies.aternos.me',
+  port:     parseInt(process.env.SERVER_PORT) || 64617,
+  username: process.env.BOT_USERNAME || 'AFKBot',
+  version:  '1.21.1'
+};
+
+const REG_PASSWORD = process.env.REG_PASSWORD || 'BotPass1234';
+
+const STATE = {
+  IDLE: 'idle', COMBAT: 'combat', FLEEING: 'fleeing',
+  SHELTERING: 'sheltering', EATING: 'eating', HUNTING: 'hunting',
+  GATHERING: 'gathering', CRAFTING: 'crafting'
+};
+
+const HP = { FLEE: 10, SHELTER: 6, SAFE: 16 };
+
+const HOSTILE_MOBS = new Set(['zombie','skeleton','creeper','spider','cave_spider','enderman','witch','pillager','vindicator','ravager','phantom','drowned','husk','stray','blaze','ghast','magma_cube','slime','silverfish','endermite','guardian','elder_guardian','shulker','zombie_villager','warden','zombified_piglin','hoglin','zoglin','bogged','breeze']);
+const FOOD_ANIMALS = new Set(['cow','pig','sheep','chicken','rabbit','mooshroom']);
+const FOOD_ITEMS = new Set(['cooked_beef','cooked_porkchop','cooked_chicken','cooked_mutton','cooked_rabbit','cooked_salmon','cooked_cod','bread','apple','golden_apple','enchanted_golden_apple','carrot','baked_potato','beef','porkchop','chicken','mutton','salmon','cod','melon_slice','sweet_berries','dried_kelp','mushroom_stew','rabbit_stew','pumpkin_pie','golden_carrot','chorus_fruit']);
 
 let bot, mcData, state = STATE.IDLE, registered = false, target = null, mainTick, lookTick, isWorking = false;
-let lastPos = null, stuckCount = 0; // New trackers
+let lastPos = null, stuckCount = 0;
 
 function createBot() {
+  state = STATE.IDLE; registered = false; target = null; isWorking = false;
   bot = mineflayer.createBot(config);
   bot.loadPlugin(pathfinder);
   bot.once('spawn', () => {
@@ -16,21 +36,22 @@ function createBot() {
     bot.pathfinder.setMovements(new Movements(bot));
     setTimeout(() => { if (!registered) tryRegister(); }, 2000);
   });
-  
-  // ... (Keep your message handling and auth logic here)
-
+  bot.on('message', (jsonMsg) => {
+    const msg = jsonMsg.toString().toLowerCase();
+    if (msg.includes('register') && !registered) tryRegister();
+    if (msg.includes('login') && !registered) tryLogin();
+    if (!registered && (msg.includes('successfully') || msg.includes('welcome'))) { registered = true; startAI(); }
+  });
   bot.on('health', () => { if (registered) handleHealth(); });
   bot.on('kicked', (r) => { cleanup(); setTimeout(createBot, 10000); });
 }
 
-// ── NEW: ADVANCED UTILITIES ──
 function checkStuck() {
   if (state === STATE.IDLE || state === STATE.COMBAT || !bot.entity) return;
   if (!lastPos) { lastPos = bot.entity.position.clone(); return; }
-  const dist = bot.entity.position.distanceTo(lastPos);
-  if (dist < 0.5) {
+  if (bot.entity.position.distanceTo(lastPos) < 0.5) {
     stuckCount++;
-    if (stuckCount > 8) { // Increased sensitivity
+    if (stuckCount > 8) {
       bot.pathfinder.setGoal(null);
       bot.setControlState('jump', true);
       setTimeout(() => bot.setControlState('jump', false), 500);
@@ -48,42 +69,31 @@ async function cleanInventory() {
   }
 }
 
-// ── INTEGRATED AI LOOP ──
 function startAI() {
   mainTick = setInterval(() => {
     if (!bot?.entity) return;
-
-    // 1. NIGHT SAFETY
     const time = bot.time.timeOfDay;
     if (time > 13000 && time < 23000 && state !== STATE.SHELTERING && state !== STATE.COMBAT) {
       setState(STATE.SHELTERING);
       buildShelter();
       return;
     }
-
-    // 2. RUN UTILITIES
-    if (!isWorking) {
-      checkStuck();
-      cleanInventory();
-    }
-
-    // 3. MAIN STATE SWITCH
+    if (!isWorking) { checkStuck(); cleanInventory(); }
     if (isWorking) return;
     switch (state) {
-      case STATE.IDLE:      idleTick();     break;
-      case STATE.COMBAT:    combatTick();   break;
-      case STATE.HUNTING:   huntTick();     break;
-      case STATE.GATHERING: gatherTick();   break;
-      case STATE.CRAFTING:  craftingTick(); break;
+      case STATE.IDLE: idleTick(); break;
+      case STATE.COMBAT: combatTick(); break;
+      case STATE.HUNTING: huntTick(); break;
+      case STATE.GATHERING: gatherTick(); break;
+      case STATE.CRAFTING: craftingTick(); break;
     }
   }, 1000);
 }
 
-// ... (Paste your original idleTick, combatTick, gatherTick, craftingTick, etc., below here)
+// ... (Copy all your original functions: tryRegister, handleHealth, idleTick, combatTick, huntTick, gatherTick, craftingTick, flee, buildShelter, eatFood, equipBestWeapon, etc., here)
 
-// ── HELPER FUNCTIONS ──────────────────────────────────
-function setState(s) { if (state !== s) console.log(`[BOT] ${state} → ${s}`); state = s; }
-function stopMovement() { ['forward','back','left','right','jump','sneak','sprint'].forEach(c => bot.setControlState(c, false)); }
-function cleanup() { clearInterval(mainTick); clearInterval(lookTick); isWorking = false; if (bot?.entity) stopMovement(); }
-
+function tryRegister() { bot.chat(`/register ${REG_PASSWORD} ${REG_PASSWORD}`); }
+function tryLogin() { bot.chat(`/login ${REG_PASSWORD}`); }
+function setState(s) { state = s; }
+function cleanup() { clearInterval(mainTick); clearInterval(lookTick); }
 createBot();

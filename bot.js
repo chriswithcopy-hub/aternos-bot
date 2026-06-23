@@ -18,14 +18,15 @@ const REG_PASSWORD = process.env.REG_PASSWORD || 'BotPass1234';
 // ══════════════════════════════════════════
 // TUNING
 // ══════════════════════════════════════════
-const HP_FLEE       = 10;
-const HP_SHELTER    =  6;
-const HP_SAFE       = 16;
-const MOB_DETECT    = 12;
-const PLAYER_DETECT = 20;
-const ATK_DIST      = 3.5;
-const FOOD_GOAL     = 20;
+const HP_FLEE       = 10;   // 5 hearts  → run
+const HP_SHELTER    =  6;   // 3 hearts  → go home / build shelter
+const HP_SAFE       = 16;   // 8 hearts  → resume
+const MOB_DETECT    = 12;   // detect hostiles within N blocks
+const PLAYER_DETECT = 20;   // detect enemy players within N blocks
+const ATK_DIST      = 3.5;  // melee reach
+const FOOD_GOAL     = 20;   // keep this many food items
 
+// Reconnect back-off: starts at 20 s, doubles on throttle, caps at 90 s
 let reconnectDelay  = 20000;
 
 // ══════════════════════════════════════════
@@ -73,6 +74,7 @@ const BUILD_BLOCKS = ['cobblestone','cobbled_deepslate','dirt','sand','gravel',
 const DOORS = ['oak_door','spruce_door','birch_door','jungle_door',
                'acacia_door','dark_oak_door','mangrove_door','cherry_door'];
 
+// Useful items worth picking up off the ground
 const PICKUP_NAMES = new Set([
   ...LOGS, ...COBBLE, ...ORES,
   'coal','charcoal','iron_ingot','gold_ingot','diamond',
@@ -103,21 +105,23 @@ let startupDone = false;
 // HOUSE MEMORY
 // ══════════════════════════════════════════
 const house = {
-  pos:    null,
+  pos:    null,    // Vec3 of the house centre (persists across reconnects)
   exists: false,
-  door:   null
+  door:   null     // Vec3 of the door block
 };
 
 // ══════════════════════════════════════════
 // UTIL
 // ══════════════════════════════════════════
 const sleep = ms => new Promise(r => setTimeout(r, ms));
-const alive = () => !!(bot && bot.entity && registered);
+// True only while the current bot session is live
+const alive = () => !!(bot?.entity && registered);
 
 // ══════════════════════════════════════════
 // CREATE BOT
 // ══════════════════════════════════════════
 function createBot() {
+  // Full state reset for every new session
   state = S.STARTUP; registered = false;
   target = null; playerTarget = null; busy = false;
 
@@ -129,6 +133,7 @@ function createBot() {
     const mov = new Movements(bot);
     mov.allowSprinting = true;
     bot.pathfinder.setMovements(mov);
+    // Hard-clear any lingering movement/sneak on every fresh spawn
     stopMovement();
     console.log('[BOT] Spawned');
     startAuthFlow();
@@ -136,15 +141,19 @@ function createBot() {
 
   bot.on('message', handleMessage);
 
+  // ── Damage event: attack back or note player attacker ──────────────────
   bot.on('entityHurt', e => {
     if (e !== bot.entity || !registered) return;
+
+    // BUG FIX 1: always cancel sneak on damage (removes the crouching glitch)
     bot.setControlState('sneak', false);
 
+    // Find the nearest player that isn't ourselves
     const attacker = Object.values(bot.entities).find(en =>
       en &&
       en.type === 'player' &&
       en.isValid &&
-      en.username !== config.username &&
+      en.username !== config.username &&   // BUG FIX 2: never target self
       bot.entity.position.distanceTo(en.position) < 16
     );
 
@@ -159,9 +168,10 @@ function createBot() {
   bot.on('kicked',  r  => {
     const msg = typeof r === 'string' ? r : JSON.stringify(r);
     console.log('[KICKED]', msg);
+    // Back off longer if the server is throttling us
     if (msg.toLowerCase().includes('throttl') || msg.toLowerCase().includes('wait')) {
       reconnectDelay = Math.min(reconnectDelay * 2, 90000);
-      console.log('[RECONNECT] Throttle detected – waiting ' + (reconnectDelay/1000) + 's');
+      console.log(`[RECONNECT] Throttle detected – waiting ${reconnectDelay/1000}s`);
     }
     cleanup();
     setTimeout(createBot, reconnectDelay);
@@ -206,20 +216,20 @@ function canAttemptAuth() {
 function attemptRegister() {
   if (!canAttemptAuth()) return;
   authAttempts++; lastAuthTry = Date.now();
-  console.log('[AUTH] /register (' + authAttempts + '/' + MAX_AUTH_ATTEMPTS + ')');
-  try { bot.chat('/register ' + REG_PASSWORD + ' ' + REG_PASSWORD); } catch {}
+  console.log(`[AUTH] /register (${authAttempts}/${MAX_AUTH_ATTEMPTS})`);
+  try { bot.chat(`/register ${REG_PASSWORD} ${REG_PASSWORD}`); } catch {}
 }
 function attemptLogin() {
   if (!canAttemptAuth()) return;
   authAttempts++; lastAuthTry = Date.now();
-  console.log('[AUTH] /login (' + authAttempts + '/' + MAX_AUTH_ATTEMPTS + ')');
-  try { bot.chat('/login ' + REG_PASSWORD); } catch {}
+  console.log(`[AUTH] /login (${authAttempts}/${MAX_AUTH_ATTEMPTS})`);
+  try { bot.chat(`/login ${REG_PASSWORD}`); } catch {}
 }
 function resolveAuth() {
   if (registered) return;
   registered = true;
   clearTimeout(authWatchdog);
-  reconnectDelay = 20000;
+  reconnectDelay = 20000;   // reset back-off on successful auth
   console.log('[BOT] Auth OK – starting AI');
   startAI();
 }
@@ -249,10 +259,12 @@ function handleMessage(msg) {
 // ══════════════════════════════════════════
 function onHealth() {
   const hp = bot.health, food = bot.food;
-  console.log('[HP:' + hp.toFixed(0) + ' Food:' + food + ' State:' + state + ']');
+  console.log(`[HP:${hp.toFixed(0)} Food:${food} State:${state}]`);
 
+  // Eat if hungry
   if (food <= 8 && ![S.HOME, S.SHELTER, S.EAT].includes(state) && hasFood()) eatFood();
 
+  // Critical HP → go home if possible, else flee
   if (hp <= HP_SHELTER && ![S.HOME, S.SHELTER, S.FLEE].includes(state)) {
     if (house.pos) { setState(S.HOME); goHome(); }
     else { setState(S.FLEE); flee(); }
@@ -271,7 +283,7 @@ function startAI() {
   clearInterval(mainLoop); clearInterval(lookLoop);
 
   mainLoop = setInterval(async () => {
-    if (!bot || !bot.entity || busy) return;
+    if (!bot?.entity || busy) return;
     try {
       switch (state) {
         case S.STARTUP:       await startupTick();      break;
@@ -293,13 +305,24 @@ function startAI() {
   }, 1000);
 
   lookLoop = setInterval(() => {
-    if (state === S.IDLE && bot && bot.entity)
+    if (state === S.IDLE && bot?.entity)
       bot.look((Math.random()*2-1)*Math.PI, (Math.random()-0.5)*(Math.PI/3), true);
   }, 3000);
 }
 
 // ══════════════════════════════════════════
-// STARTUP SEQUENCE
+// STARTUP SEQUENCE  (BUG FIX 3: proper crafting table flow)
+//
+// mineflayer's recipesFor() only returns a recipe when you
+// already have the ingredients.  Sticks need planks; a wooden
+// pickaxe needs a 3×3 grid → crafting table.  The old code
+// tried to make sticks/pickaxe before either existed, so it
+// always got "No recipe".  We now follow the correct order:
+//
+//  logs → planks (2×2, no table)
+//  planks → crafting_table (2×2, no table)
+//  place table → sticks + wooden_pickaxe at table
+//  mine stone → stone_pickaxe + stone tools at table
 // ══════════════════════════════════════════
 async function startupTick() {
   if (busy) return;
@@ -307,6 +330,7 @@ async function startupTick() {
   busy = true;
 
   try {
+    // ── Phase 1: collect 5 logs ──────────────────────────────────────────
     console.log('[STARTUP] P1: collect 5 logs');
     while (alive() && countItems(LOGS) < 5) {
       const lb = findNearBlock(LOGS, 40);
@@ -321,16 +345,20 @@ async function startupTick() {
     }
     if (!alive()) { busy = false; return; }
 
+    // ── Phase 2: logs → planks (no crafting table needed) ───────────────
     console.log('[STARTUP] P2: craft planks');
     await craftLogsIntoPlanks();
     await sleep(300);
+    console.log(`[STARTUP] Planks in inventory: ${countItems(PLANKS)}`);
 
+    // ── Phase 3: make crafting table (4 planks, 2×2) ────────────────────
     console.log('[STARTUP] P3: make crafting table');
     if (!hasItem('crafting_table') && !findNearBlock(['crafting_table'], 16)) {
       await makeNoTable('crafting_table', 1);
       await sleep(300);
     }
 
+    // ── Phase 4: place crafting table & go to it ─────────────────────────
     let table = findNearBlock(['crafting_table'], 10);
     if (!table && hasItem('crafting_table')) {
       await placeBlockNear('crafting_table');
@@ -341,6 +369,7 @@ async function startupTick() {
       await bot.pathfinder.goto(new GoalNear(table.position.x, table.position.y, table.position.z, 2));
     }
 
+    // ── Phase 5: sticks + wooden pickaxe ────────────────────────────────
     console.log('[STARTUP] P4: craft sticks + wooden pickaxe');
     await make('stick', 4, table);
     await sleep(200);
@@ -348,6 +377,7 @@ async function startupTick() {
     await sleep(200);
     if (!alive()) { busy = false; return; }
 
+    // ── Phase 6: mine 3 stone ───────────────────────────────────────────
     console.log('[STARTUP] P5: mine 3 stone');
     while (alive() && countItems(COBBLE) < 3) {
       equipBest(PICK_P);
@@ -362,6 +392,7 @@ async function startupTick() {
     }
     if (!alive()) { busy = false; return; }
 
+    // ── Phase 7: stone pickaxe ──────────────────────────────────────────
     console.log('[STARTUP] P6: craft stone pickaxe');
     table = findNearBlock(['crafting_table'], 10);
     if (!table && hasItem('crafting_table')) {
@@ -375,6 +406,7 @@ async function startupTick() {
     await sleep(200);
     if (!alive()) { busy = false; return; }
 
+    // ── Phase 8: gather more wood + stone ───────────────────────────────
     console.log('[STARTUP] P7: stock up on wood & stone');
     while (alive() && (countItems(LOGS) < 12 || countItems(COBBLE) < 12)) {
       if (countItems(LOGS) < 12) {
@@ -404,8 +436,9 @@ async function startupTick() {
     }
     if (!alive()) { busy = false; return; }
 
+    // ── Phase 9: craft full stone tool set ──────────────────────────────
     console.log('[STARTUP] P8: craft stone tools');
-    await craftLogsIntoPlanks();
+    await craftLogsIntoPlanks();   // convert extra logs for sticks
     table = findNearBlock(['crafting_table'], 10);
     if (!table && hasItem('crafting_table')) {
       await placeBlockNear('crafting_table');
@@ -421,13 +454,14 @@ async function startupTick() {
     if (countItems(COBBLE) >= 8) await make('furnace', 1, table);
 
     startupDone = true;
-    console.log('[STARTUP] Done!');
+    console.log('[STARTUP] ✅ Done!');
   } catch(e) { console.log('[STARTUP ERROR]', e.message); }
 
   busy = false;
   setState(S.IDLE);
 }
 
+// Convert every log in inventory to planks using the 2×2 grid (no table needed)
 async function craftLogsIntoPlanks() {
   for (const log of bot.inventory.items().filter(i => LOGS.includes(i.name))) {
     const plankName = log.name.replace('_log','_planks');
@@ -441,38 +475,48 @@ async function craftLogsIntoPlanks() {
   }
 }
 
+// make() variant that explicitly uses no crafting table (2×2 grid only)
 async function makeNoTable(name, count) {
   return make(name, count, null);
 }
 
 // ══════════════════════════════════════════
-// IDLE
+// IDLE – PRIORITY QUEUE
 // ══════════════════════════════════════════
 async function idleTick() {
+  // P0 – pick up useful ground items nearby
   if (hasUsefulGroundItems(16)) { setState(S.PICKUP); return; }
 
+  // P1 – hostile mob nearby
   const mob = nearbyEntity(HOSTILE, MOB_DETECT);
   if (mob) { target = mob; setState(S.COMBAT); return; }
 
-  if (playerTarget && playerTarget.isValid) { setState(S.PVP); return; }
+  // P1b – follow up on an ongoing player fight
+  if (playerTarget?.isValid) { setState(S.PVP); return; }
 
+  // P2 – eat
   if (bot.food <= 14 && hasFood()) { await eatFood(); return; }
 
+  // P3 – smelt ores in furnace
   if (hasItem(ORES) && (hasFurnaceNearby() || hasItem('furnace'))) { setState(S.SMELT); return; }
 
+  // P4 – cook raw meat
   if (hasRawFood() && (hasFurnaceNearby() || hasItem('furnace'))) { setState(S.COOK); return; }
 
+  // P5 – hunt for food
   if (foodCount() < FOOD_GOAL) {
     const animal = nearbyEntity(ANIMALS, 24);
     if (animal) { target = animal; setState(S.HUNT); return; }
   }
 
+  // P6 – craft tools if missing
   if (needsCrafting()) {
     const wood = countItems(LOGS)*4 + countItems(PLANKS);
     setState(wood >= 12 ? S.CRAFT : S.WOOD);
     return;
   }
 
+  // P7 – upgrade wooden → stone tools
   const hasStoneOrBetter = hasItem([
     'stone_sword','stone_pickaxe','stone_axe',
     'iron_sword','iron_pickaxe','iron_axe',
@@ -484,12 +528,16 @@ async function idleTick() {
     return;
   }
 
+  // P8 – stock wood
   if (countItems(LOGS) < 16 && findNearBlock(LOGS, 32)) { setState(S.WOOD); return; }
 
+  // P9 – repair house if damaged
   if (house.pos && !isHouseIntact()) { setState(S.REPAIR_HOUSE); return; }
 
+  // P10 – build house if none
   if (!house.pos) { setState(S.BUILD_HOUSE); return; }
 
+  // P11 – wander/idle
   if (Math.random() < 0.25) wander();
   if (Math.random() < 0.06) doJump();
   if (Math.random() < 0.04) bot.swingArm();
@@ -502,8 +550,8 @@ function hasUsefulGroundItems(dist) {
   return Object.values(bot.entities).some(e =>
     e.type === 'object' && e.objectType === 'Item' &&
     bot.entity.position.distanceTo(e.position) < dist &&
-    PICKUP_NAMES.has(e.metadata && e.metadata[8] && e.metadata[8].itemId
-      ? (mcData.items[e.metadata[8].itemId] && mcData.items[e.metadata[8].itemId].name || '')
+    PICKUP_NAMES.has(e.metadata?.[8]?.itemId
+      ? (mcData.items[e.metadata[8].itemId]?.name || '')
       : '')
   );
 }
@@ -513,9 +561,7 @@ async function pickupTick() {
   const items = Object.values(bot.entities).filter(e => {
     if (e.type !== 'object' || e.objectType !== 'Item') return false;
     if (bot.entity.position.distanceTo(e.position) > 20) return false;
-    const name = (e.metadata && e.metadata[8] && e.metadata[8].itemId &&
-                  mcData.items[e.metadata[8].itemId] &&
-                  mcData.items[e.metadata[8].itemId].name) || '';
+    const name = mcData.items[e.metadata?.[8]?.itemId]?.name || '';
     return PICKUP_NAMES.has(name);
   });
   if (!items.length) { setState(S.IDLE); return; }
@@ -543,6 +589,7 @@ async function buildHouseTick() {
   if (busy) return;
   busy = true;
   try {
+    // Pick a spot 6 blocks in front of the bot
     const dir = bot.entity.yaw;
     const cx  = Math.round(bot.entity.position.x + Math.sin(-dir) * 6);
     const cy  = Math.round(bot.entity.position.y);
@@ -561,10 +608,13 @@ async function buildHouseTick() {
 
     await bot.equip(buildBlock, 'hand');
 
+    // Build a simple 5×3×5 (width × height × depth) box with one door gap
     for (let h = 0; h < 3; h++) {
       for (let x = -2; x <= 2; x++) {
         for (let z = -2; z <= 2; z++) {
+          // Only walls (perimeter)
           if (Math.abs(x) !== 2 && Math.abs(z) !== 2) continue;
+          // Leave a 1-block door gap on the front wall, ground level
           if (h === 0 && x === 0 && z === 2) {
             house.door = new Vec3(cx + x, cy + h, cz + z);
             continue;
@@ -583,6 +633,7 @@ async function buildHouseTick() {
       }
     }
 
+    // Place door if we have one
     const doorItem = bot.inventory.items().find(i => DOORS.includes(i.name));
     if (doorItem && house.door) {
       try {
@@ -678,10 +729,10 @@ function waitUntilSafe() {
 }
 
 // ══════════════════════════════════════════
-// COMBAT
+// COMBAT (hostile mobs)
 // ══════════════════════════════════════════
 function combatTick() {
-  if (!target || !target.isValid) { target = null; setState(S.IDLE); return; }
+  if (!target?.isValid) { target = null; setState(S.IDLE); return; }
   if (bot.health <= HP_FLEE) {
     bot.pathfinder.setGoal(null);
     setState(house.pos ? S.HOME : S.FLEE);
@@ -698,9 +749,10 @@ function combatTick() {
     bot.pathfinder.setGoal(null);
     bot.lookAt(target.position.offset(0, target.height * 0.9, 0));
     bot.attack(target);
-    if (bot.entity.onGround && Math.random() > 0.4) doJump();
+    if (bot.entity.onGround && Math.random() > 0.4) doJump(); // crit
   }
 
+  // Re-target the closest threat
   const closest = nearbyEntity(HOSTILE, MOB_DETECT);
   if (closest && closest !== target) {
     if (bot.entity.position.distanceTo(closest.position) <
@@ -709,10 +761,10 @@ function combatTick() {
 }
 
 // ══════════════════════════════════════════
-// PVP
+// PVP (player attacked us – fight back)
 // ══════════════════════════════════════════
 function pvpTick() {
-  if (!playerTarget || !playerTarget.isValid) { playerTarget = null; setState(S.IDLE); return; }
+  if (!playerTarget?.isValid) { playerTarget = null; setState(S.IDLE); return; }
   if (bot.health <= HP_FLEE) {
     bot.pathfinder.setGoal(null);
     playerTarget = null;
@@ -732,19 +784,19 @@ function pvpTick() {
     bot.pathfinder.setGoal(null);
     bot.lookAt(playerTarget.position.offset(0, playerTarget.height * 0.9, 0));
     bot.attack(playerTarget);
-    if (bot.entity.onGround && Math.random() > 0.5) doJump();
+    if (bot.entity.onGround && Math.random() > 0.5) doJump(); // crit
   }
 }
 
 // ══════════════════════════════════════════
-// HUNT
+// HUNT (food supply)
 // ══════════════════════════════════════════
 async function huntTick() {
   const mob = nearbyEntity(HOSTILE, MOB_DETECT);
   if (mob) { bot.pathfinder.setGoal(null); target = mob; setState(S.COMBAT); return; }
   if (foodCount() >= FOOD_GOAL) { bot.pathfinder.setGoal(null); target = null; setState(S.IDLE); return; }
 
-  if (!target || !target.isValid) {
+  if (!target?.isValid) {
     target = nearbyEntity(ANIMALS, 24);
     if (!target) { if (hasFood()) await eatFood(); setState(S.IDLE); return; }
   }
@@ -840,6 +892,7 @@ async function craftTick() {
     if (!hasItem('furnace') && !hasFurnaceNearby() && cobble >= 8)
       await make('furnace', 1, table);
 
+    // Upgrade wooden → stone if we now have cobble
     const c2 = countItems(COBBLE);
     if (c2 >= 2 && hasItem(['wooden_sword'])    && !hasItem(['stone_sword','iron_sword','diamond_sword','netherite_sword']))
       await make('stone_sword', 1, table);
@@ -855,7 +908,7 @@ async function craftTick() {
 }
 
 // ══════════════════════════════════════════
-// COOK
+// COOK (raw food → cooked food)
 // ══════════════════════════════════════════
 async function cookTick() {
   if (busy) return; busy = true;
@@ -894,7 +947,7 @@ async function cookTick() {
 }
 
 // ══════════════════════════════════════════
-// SMELT
+// SMELT (ores → ingots)
 // ══════════════════════════════════════════
 async function smeltTick() {
   if (busy) return; busy = true;
@@ -940,6 +993,7 @@ function flee() {
   stopMovement();
   console.log('[BOT] FLEE!');
 
+  // BUG FIX 4: if house is nearby, run there instead of random direction
   if (house.pos) {
     const houseDist = bot.entity.position.distanceTo(house.pos);
     if (houseDist < 80) {
@@ -950,10 +1004,11 @@ function flee() {
     }
   }
 
-  const mob = nearbyEntity(HOSTILE, 20);
+  // Otherwise flee away from threat
+  const mob = nearbyEntity(HOSTILE, 20) || nearbyEntity(new Set([playerTarget?.name||'__']), 20);
   if (!mob) { setState(S.IDLE); return; }
-  const p = bot.entity.position, t2 = mob.position;
-  const dx = p.x-t2.x, dz = p.z-t2.z, len = Math.sqrt(dx*dx+dz*dz)||1;
+  const p = bot.entity.position, t = mob.position;
+  const dx = p.x-t.x, dz = p.z-t.z, len = Math.sqrt(dx*dx+dz*dz)||1;
   bot.pathfinder.setGoal(new GoalNear(p.x + dx/len*30, p.y, p.z + dz/len*30, 2));
 
   const ck = setInterval(() => {
@@ -971,13 +1026,13 @@ function flee() {
 }
 
 // ══════════════════════════════════════════
-// TEMP SHELTER
+// TEMP SHELTER (no house built yet)
 // ══════════════════════════════════════════
 async function buildTempShelter() {
   bot.setControlState('sneak', true);
   console.log('[BOT] Building temp shelter!');
   const blockItem = bot.inventory.items().find(i => BUILD_BLOCKS.includes(i.name));
-  if (blockItem && blockItem.count >= 3) {
+  if (blockItem?.count >= 3) {
     await bot.equip(blockItem, 'hand');
     const pos = bot.entity.position.floored();
     for (const s of [new Vec3(1,0,0),new Vec3(-1,0,0),new Vec3(0,0,1),new Vec3(0,0,-1)]) {
@@ -1014,7 +1069,7 @@ async function eatFood() {
     setState(S.EAT);
     await bot.equip(food, 'hand');
     await bot.consume();
-    console.log('[EAT]', food.name, '-> food level:', bot.food);
+    console.log('[EAT]', food.name, '→ food level:', bot.food);
   } catch(e) { console.log('[EAT ERROR]', e.message); }
   finally { setState(prev === S.EAT ? S.IDLE : prev); }
 }
@@ -1027,14 +1082,14 @@ async function make(name, count, table) {
   if (!item) return false;
   const r = bot.recipesFor(item.id, null, 1, table);
   if (!r.length) {
-    console.log('[CRAFT] No recipe for "' + name + '" (table=' + (!!table) + ', planks=' + countItems(PLANKS) + ', cobble=' + countItems(COBBLE) + ')');
+    console.log(`[CRAFT] No recipe for "${name}" (table=${!!table}, have planks=${countItems(PLANKS)}, cobble=${countItems(COBBLE)})`);
     return false;
   }
   try {
     await bot.craft(r[0], count, table);
-    console.log('[CRAFT] OK ' + count + 'x ' + name);
+    console.log(`[CRAFT] ✅ ${count}x ${name}`);
     return true;
-  } catch(e) { console.log('[CRAFT] FAIL ' + name + ':', e.message); return false; }
+  } catch(e) { console.log(`[CRAFT] ❌ ${name}:`, e.message); return false; }
 }
 
 async function placeBlockNear(itemName) {
@@ -1042,8 +1097,8 @@ async function placeBlockNear(itemName) {
   if (!item) return;
   const pos = bot.entity.position.floored();
   for (const off of [new Vec3(1,0,0),new Vec3(-1,0,0),new Vec3(0,0,1),new Vec3(0,0,-1)]) {
-    const tgt = bot.blockAt(pos.plus(off));
-    if (tgt && tgt.name === 'air') {
+    const target = bot.blockAt(pos.plus(off));
+    if (target?.name === 'air') {
       const ground = bot.blockAt(pos.plus(off).offset(0,-1,0));
       if (ground && !['air','cave_air'].includes(ground.name)) {
         try {
@@ -1057,7 +1112,7 @@ async function placeBlockNear(itemName) {
 }
 
 function findNearBlock(names, dist) {
-  const ids = names.map(n => mcData.blocksByName[n] && mcData.blocksByName[n].id).filter(Boolean);
+  const ids = names.map(n => mcData.blocksByName[n]?.id).filter(Boolean);
   return ids.length ? bot.findBlock({ matching: ids, maxDistance: dist }) : null;
 }
 
@@ -1118,7 +1173,7 @@ function stopMovement() {
 }
 
 function setState(s) {
-  if (state !== s) console.log('[STATE] ' + state + ' -> ' + s);
+  if (state !== s) console.log(`[STATE] ${state} → ${s}`);
   state = s;
 }
 
@@ -1128,9 +1183,7 @@ function cleanup() {
   busy = false;
   registered = false;
   try { stopMovement(); } catch {}
-  try { if (bot && bot.end) bot.end(); } catch {}
+  try { bot?.end?.(); } catch {}   // BUG FIX 5: cleanly close old session before reconnect
 }
 
 createBot();
-ENDOFFILE
-echo "Exit: $?"

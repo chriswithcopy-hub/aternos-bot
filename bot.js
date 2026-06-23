@@ -1,6 +1,6 @@
 const mineflayer = require('mineflayer');
 const { pathfinder, Movements, goals } = require('mineflayer-pathfinder');
-const { GoalNear } = goals;
+const { GoalNear, GoalGetToBlock } = goals;
 const { Vec3 } = require('vec3');
 
 const config = {
@@ -14,9 +14,9 @@ const REG_PASSWORD = process.env.REG_PASSWORD || 'BotPass1234';
 
 // HP thresholds (max HP = 20)
 const HP = {
-  FLEE:    10,  // 5 hearts → run away
-  SHELTER: 6,   // 3 hearts → build dirt shelter
-  SAFE:    16   // 8 hearts → safe to come back out
+  FLEE:    10,  
+  SHELTER: 6,   
+  SAFE:    16   
 };
 
 const HOSTILE_MOBS = new Set([
@@ -46,34 +46,39 @@ const STATE = {
   FLEEING:    'fleeing',
   SHELTERING: 'sheltering',
   EATING:     'eating',
-  HUNTING:    'hunting'
+  HUNTING:    'hunting',
+  GATHERING:  'gathering',
+  CRAFTING:   'crafting'
 };
 
 let bot;
+let mcData;
 let state      = STATE.IDLE;
 let registered = false;
 let target     = null;
 let mainTick;
 let lookTick;
+let isWorking  = false; // Prevents overlapping async tasks (mining, crafting)
 
 // ─────────────────────────────────────────────
 function createBot() {
   state      = STATE.IDLE;
   registered = false;
   target     = null;
+  isWorking  = false;
 
   bot = mineflayer.createBot(config);
   bot.loadPlugin(pathfinder);
 
   bot.once('spawn', () => {
     console.log('[BOT] Spawned');
+    mcData = require('minecraft-data')(bot.version);
     bot.pathfinder.setMovements(new Movements(bot));
     setTimeout(() => { if (!registered) tryRegister(); }, 2000);
   });
 
   bot.on('message', (jsonMsg) => {
     const msg = jsonMsg.toString().toLowerCase();
-    console.log('[SERVER]', msg);
     if (msg.includes('register') && !msg.includes('registered') && !registered) tryRegister();
     if ((msg.includes('login') || msg.includes('log in')) && !registered) tryLogin();
     if (!registered && (
@@ -98,38 +103,31 @@ function createBot() {
 
 // ── AUTH ─────────────────────────────────────
 function tryRegister() {
-  console.log('[BOT] Sending /register...');
   bot.chat(`/register ${REG_PASSWORD} ${REG_PASSWORD}`);
   setTimeout(() => { if (!registered) { registered = true; startAI(); } }, 5000);
 }
 function tryLogin() {
-  console.log('[BOT] Sending /login...');
   bot.chat(`/login ${REG_PASSWORD}`);
 }
 
 // ── HEALTH HANDLER ───────────────────────────
 function handleHealth() {
   const hp = bot.health;
-  console.log(`[HP: ${hp}] [Food: ${bot.food}] [State: ${state}]`);
 
-  // Eat if starving
   if (bot.food <= 8 && state !== STATE.SHELTERING) eatFood();
 
-  // Critical HP → shelter
-  if (hp <= HP.SHELTER && state !== STATE.SHELTERING) {
+  if (hp <= HP.SHELTER && state !== STATE.SHELTERING && state !== STATE.CRAFTING) {
     setState(STATE.SHELTERING);
     buildShelter();
     return;
   }
 
-  // Low HP → flee
-  if (hp <= HP.FLEE && state !== STATE.FLEEING && state !== STATE.SHELTERING) {
+  if (hp <= HP.FLEE && state !== STATE.FLEEING && state !== STATE.SHELTERING && state !== STATE.CRAFTING) {
     setState(STATE.FLEEING);
     flee();
     return;
   }
 
-  // Recovered → back to idle
   if (hp >= HP.SAFE && state === STATE.FLEEING) setState(STATE.IDLE);
 }
 
@@ -138,57 +136,64 @@ function startAI() {
   clearInterval(mainTick);
   clearInterval(lookTick);
 
+  bot.lastAttackTime = 0;
+  bot.skipGatherUntil = 0;
+
   mainTick = setInterval(() => {
-    if (!bot?.entity) return;
+    if (!bot?.entity || isWorking) return;
     switch (state) {
-      case STATE.IDLE:    idleTick();   break;
-      case STATE.COMBAT:  combatTick(); break;
-      case STATE.HUNTING: huntTick();   break;
+      case STATE.IDLE:       idleTick();      break;
+      case STATE.COMBAT:     combatTick();    break;
+      case STATE.HUNTING:    huntTick();      break;
+      case STATE.GATHERING:  gatherTick();    break;
+      case STATE.CRAFTING:   craftingTick();  break;
     }
   }, 1000);
 
-  // Look around while idle
   lookTick = setInterval(() => {
-    if (state === STATE.IDLE && bot?.entity) {
-      bot.look(
-        (Math.random() * 2 - 1) * Math.PI,
-        (Math.random() - 0.5) * (Math.PI / 3),
-        true
-      );
+    if (state === STATE.IDLE && bot?.entity && !isWorking) {
+      bot.look((Math.random() * 2 - 1) * Math.PI, (Math.random() - 0.5) * (Math.PI / 3), true);
     }
   }, 3000);
 }
 
 // ── IDLE ─────────────────────────────────────
 function idleTick() {
-  // Hostile mob nearby → fight
+  // 1. Hostile mob nearby → fight
   const hostile = getNearestEntity(HOSTILE_MOBS, 16);
   if (hostile) { target = hostile; setState(STATE.COMBAT); return; }
 
-  // Hungry → hunt or eat
+  // 2. Need Tools → gather wood or craft
+  const hasWeapon = bot.inventory.items().some(i => i.name.includes('sword') || i.name.includes('axe'));
+  if (!hasWeapon && Date.now() > bot.skipGatherUntil) {
+    const hasMaterials = bot.inventory.items().some(i => i.name.includes('log') || i.name.includes('planks'));
+    if (hasMaterials) {
+      setState(STATE.CRAFTING);
+    } else {
+      setState(STATE.GATHERING);
+    }
+    return;
+  }
+
+  // 3. Hungry → hunt or eat
   if (bot.food < 15) {
     if (hasFood()) { eatFood(); return; }
     const animal = getNearestEntity(FOOD_ANIMALS, 20);
     if (animal) { target = animal; setState(STATE.HUNTING); return; }
   }
 
-  // Random wander
+  // 4. Random wander
   if (Math.random() < 0.25) randomWalk();
-  // Random jump
   if (Math.random() < 0.08) {
     bot.setControlState('jump', true);
     setTimeout(() => bot.setControlState('jump', false), 300);
   }
-  // Swing arm
-  if (Math.random() < 0.05) bot.swingArm();
 }
 
-// ── COMBAT ───────────────────────────────────
-function combatTick() {
-  // Target gone → idle
+// ── COMBAT (ADVANCED) ────────────────────────
+async function combatTick() {
   if (!target?.isValid) { target = null; setState(STATE.IDLE); return; }
 
-  // Too hurt → flee
   if (bot.health <= HP.FLEE) {
     bot.pathfinder.setGoal(null);
     target = null;
@@ -197,80 +202,216 @@ function combatTick() {
     return;
   }
 
+  // Equip best weapon automatically
+  await equipBestWeapon();
+
   const dist = bot.entity.position.distanceTo(target.position);
 
-  if (dist > 3) {
-    // Chase the target
-    bot.pathfinder.setGoal(
-      new GoalNear(target.position.x, target.position.y, target.position.z, 2)
-    );
+  if (dist > 3.0) {
+    bot.pathfinder.setGoal(new GoalNear(target.position.x, target.position.y, target.position.z, 2));
+    bot.setControlState('back', false);
+    bot.setControlState('jump', false);
   } else {
-    // Close enough — attack
+    // Stop pathfinding, aim directly
     bot.pathfinder.setGoal(null);
     bot.lookAt(target.position.offset(0, target.height * 0.9, 0));
-    bot.attack(target);
-    // Crit hit: jump while attacking
-    if (bot.entity.onGround && Math.random() > 0.4) {
-      bot.setControlState('jump', true);
-      setTimeout(() => bot.setControlState('jump', false), 250);
+
+    const now = Date.now();
+    // Enforce an attack cooldown so we don't spam and ruin the critical jump rhythm
+    if (now - bot.lastAttackTime > 700) {
+      if (bot.entity.onGround) {
+        // 1. Jump for critical hit
+        bot.setControlState('jump', true);
+        // 2. Start moving backwards to kite
+        bot.setControlState('back', true); 
+
+        // 3. Attack when falling back down (approx 300ms after jump)
+        setTimeout(() => {
+          if (target?.isValid) {
+            bot.attack(target);
+            bot.lastAttackTime = Date.now();
+          }
+          bot.setControlState('jump', false);
+        }, 300);
+
+        // 4. Stop moving backward after landing
+        setTimeout(() => {
+          bot.setControlState('back', false);
+        }, 700);
+      }
     }
   }
 
   // Switch target if closer hostile appears
   const closer = getNearestEntity(HOSTILE_MOBS, 16);
   if (closer && closer !== target) {
-    const d1 = bot.entity.position.distanceTo(closer.position);
-    const d2 = bot.entity.position.distanceTo(target.position);
-    if (d1 < d2) target = closer;
+    if (bot.entity.position.distanceTo(closer.position) < bot.entity.position.distanceTo(target.position)) {
+      target = closer;
+    }
   }
 }
 
 // ── HUNTING ──────────────────────────────────
 function huntTick() {
-  // Full enough → stop hunting
   if (bot.food >= 17) { bot.pathfinder.setGoal(null); target = null; setState(STATE.IDLE); return; }
 
-  // If hostile mob gets close, fight it first
   const hostile = getNearestEntity(HOSTILE_MOBS, 10);
   if (hostile) { bot.pathfinder.setGoal(null); target = hostile; setState(STATE.COMBAT); return; }
 
   if (!target?.isValid) {
     const animal = getNearestEntity(FOOD_ANIMALS, 20);
-    if (animal) {
-      target = animal;
-    } else {
+    if (animal) target = animal;
+    else {
       if (hasFood()) eatFood();
       setState(STATE.IDLE);
       return;
     }
   }
 
+  equipBestWeapon(); // Equip sword/axe to kill animals faster
+
   const dist = bot.entity.position.distanceTo(target.position);
   if (dist > 3) {
-    bot.pathfinder.setGoal(
-      new GoalNear(target.position.x, target.position.y, target.position.z, 2)
-    );
+    bot.pathfinder.setGoal(new GoalNear(target.position.x, target.position.y, target.position.z, 2));
   } else {
     bot.pathfinder.setGoal(null);
     bot.lookAt(target.position.offset(0, target.height * 0.9, 0));
-    bot.attack(target);
+    if (Date.now() - bot.lastAttackTime > 600) {
+      bot.attack(target);
+      bot.lastAttackTime = Date.now();
+    }
   }
 }
 
-// ── FLEE ─────────────────────────────────────
+// ── GATHERING WOOD ───────────────────────────
+async function gatherTick() {
+  if (isWorking) return;
+  isWorking = true;
+
+  const log = bot.findBlock({ matching: b => b.name.includes('log'), maxDistance: 32 });
+  
+  if (!log) {
+    console.log('[BOT] No logs nearby, pausing gathering.');
+    bot.skipGatherUntil = Date.now() + 15000; // Wait 15 seconds before trying again
+    isWorking = false;
+    setState(STATE.IDLE);
+    return;
+  }
+
+  try {
+    const dist = bot.entity.position.distanceTo(log.position);
+    if (dist > 4) {
+      bot.pathfinder.setGoal(new GoalGetToBlock(log.position.x, log.position.y, log.position.z));
+      isWorking = false; // allow pathfinder to tick
+    } else {
+      bot.pathfinder.setGoal(null);
+      await bot.lookAt(log.position);
+      
+      // Equip axe if we have one
+      const axe = bot.inventory.items().find(i => i.name.includes('axe'));
+      if (axe) await bot.equip(axe, 'hand');
+      
+      await bot.dig(log);
+      console.log(`[BOT] Mined ${log.name}`);
+      isWorking = false;
+    }
+  } catch (err) {
+    console.log('[BOT] Gather error:', err.message);
+    isWorking = false;
+  }
+}
+
+// ── CRAFTING ─────────────────────────────────
+async function craftingTick() {
+  if (isWorking) return;
+  isWorking = true;
+  bot.pathfinder.setGoal(null);
+  console.log('[BOT] Starting auto-crafting sequence...');
+
+  const count = (nameStr) => bot.inventory.items().filter(i => i.name.includes(nameStr)).reduce((a, b) => a + b.count, 0);
+
+  try {
+    // 1. Logs -> Planks
+    if (count('log') > 0 && count('planks') < 8) {
+      const logItem = bot.inventory.items().find(i => i.name.includes('log'));
+      if (logItem) {
+        const woodType = logItem.name.split('_')[0];
+        const plankItem = mcData.itemsByName[`${woodType}_planks`] || mcData.itemsByName['oak_planks'];
+        if (plankItem) {
+          const recipe = bot.recipesFor(plankItem.id, null, 1, null)[0];
+          if (recipe) await bot.craft(recipe, 1, null);
+        }
+      }
+    }
+
+    // 2. Planks -> Sticks
+    if (count('planks') >= 2 && count('stick') < 4) {
+      const stickId = mcData.itemsByName['stick'].id;
+      const recipe = bot.recipesFor(stickId, null, 1, null)[0];
+      if (recipe) await bot.craft(recipe, 1, null);
+    }
+
+    // 3. Planks -> Crafting Table
+    if (count('planks') >= 4 && count('crafting_table') === 0) {
+      const tableId = mcData.itemsByName['crafting_table'].id;
+      const recipe = bot.recipesFor(tableId, null, 1, null)[0];
+      if (recipe) await bot.craft(recipe, 1, null);
+    }
+
+    // 4. Place Table & Craft Tools
+    if (count('crafting_table') > 0 && count('stick') > 0 && count('planks') >= 2) {
+      const tableItem = bot.inventory.items().find(i => i.name === 'crafting_table');
+      await bot.equip(tableItem, 'hand');
+      
+      // Find a safe ground block to place the table on
+      const pos = bot.entity.position.floored();
+      const refBlock = bot.blockAt(pos.offset(1, -1, 0)) || bot.blockAt(pos.offset(0, -1, 1)); 
+      
+      if (refBlock && !['air', 'cave_air', 'water', 'lava'].includes(refBlock.name)) {
+        await bot.placeBlock(refBlock, new Vec3(0, 1, 0));
+        await bot.waitForTicks(5);
+        
+        // Find the placed table
+        const tableBlock = bot.findBlock({ matching: mcData.blocksByName['crafting_table'].id, maxDistance: 4 });
+        
+        if (tableBlock) {
+          // Craft Axe
+          if (count('axe') === 0) {
+            const axeId = mcData.itemsByName['wooden_axe'].id;
+            const recipe = bot.recipesFor(axeId, null, 1, tableBlock)[0];
+            if (recipe) await bot.craft(recipe, 1, tableBlock);
+          }
+          // Craft Sword
+          if (count('sword') === 0) {
+            const swordId = mcData.itemsByName['wooden_sword'].id;
+            const recipe = bot.recipesFor(swordId, null, 1, tableBlock)[0];
+            if (recipe) await bot.craft(recipe, 1, tableBlock);
+          }
+
+          // Break the table to take it with us
+          const bestTool = bot.inventory.items().find(i => i.name.includes('axe'));
+          if (bestTool) await bot.equip(bestTool, 'hand');
+          await bot.dig(tableBlock);
+        }
+      }
+    }
+  } catch (err) {
+    console.log('[BOT] Crafting failed/interrupted:', err.message);
+  }
+
+  isWorking = false;
+  setState(STATE.IDLE);
+}
+
+// ── FLEE (UPDATED) ───────────────────────────
 function flee() {
   bot.pathfinder.setGoal(null);
   stopMovement();
   console.log('[BOT] FLEEING!');
 
   const check = setInterval(() => {
-    // Stop the loop if the bot disconnected or changed state
-    if (!bot || state !== STATE.FLEEING) { 
-      clearInterval(check); 
-      return; 
-    }
+    if (!bot || state !== STATE.FLEEING) { clearInterval(check); return; }
 
-    // Getting worse → shelter
     if (bot.health <= HP.SHELTER) {
       clearInterval(check);
       bot.pathfinder.setGoal(null);
@@ -281,7 +422,6 @@ function flee() {
 
     const threat = getNearestEntity(HOSTILE_MOBS, 20);
 
-    // Safe now → idle
     if (!threat && bot.health >= HP.SAFE) {
       clearInterval(check);
       bot.pathfinder.setGoal(null);
@@ -290,7 +430,6 @@ function flee() {
       return;
     }
 
-    // If a threat is still nearby, keep updating the escape route!
     if (threat) {
       const pos = bot.entity.position;
       const tp  = threat.position;
@@ -298,18 +437,14 @@ function flee() {
       const dz  = pos.z - tp.z;
       const len = Math.sqrt(dx * dx + dz * dz) || 1;
 
-      // Continuously run away 20 blocks in the opposite direction
       bot.pathfinder.setGoal(
         new GoalNear(pos.x + (dx / len) * 20, pos.y, pos.z + (dz / len) * 20, 2)
       );
     } else {
-      // No threat nearby, but still waiting to heal. Stand still and eat!
       bot.pathfinder.setGoal(null);
-      if (bot.food < 20 && hasFood()) {
-        eatFood();
-      }
+      if (bot.food < 20 && hasFood()) eatFood();
     }
-  }, 2000); // Re-evaluates the escape route every 2 seconds
+  }, 2000);
 }
 
 // ── SHELTER ──────────────────────────────────
@@ -345,8 +480,6 @@ async function buildShelter() {
     } catch (e) {
       console.log('[BOT] Shelter build error:', e.message);
     }
-  } else {
-    console.log('[BOT] No blocks — crouching and hiding in place');
   }
 
   if (hasFood()) await eatFood();
@@ -354,11 +487,9 @@ async function buildShelter() {
 }
 
 function waitForSafety() {
-  console.log('[BOT] Waiting in shelter for safety...');
   const check = setInterval(() => {
     if (!bot || state !== STATE.SHELTERING) { clearInterval(check); return; }
 
-    // Eat while waiting
     if (bot.food < 16 && hasFood()) eatFood();
 
     const noThreat = !getNearestEntity(HOSTILE_MOBS, 12);
@@ -367,34 +498,56 @@ function waitForSafety() {
     if (noThreat && hpGood) {
       clearInterval(check);
       bot.setControlState('sneak', false);
-      console.log('[BOT] All clear — leaving shelter!');
       setState(STATE.IDLE);
-    } else {
-      const nearby = getNearestEntity(HOSTILE_MOBS, 12);
-      console.log(`[BOT] Still hiding — HP: ${bot.health} | Threat: ${nearby?.name || 'none'}`);
     }
   }, 3000);
 }
 
 // ── EAT ──────────────────────────────────────
 async function eatFood() {
-  if (state === STATE.EATING) return;
+  if (state === STATE.EATING || isWorking) return;
   const food = bot.inventory.items().find(i => FOOD_ITEMS.has(i.name));
   if (!food) return;
   const prevState = state;
   try {
     setState(STATE.EATING);
+    isWorking = true;
     await bot.equip(food, 'hand');
     await bot.consume();
     console.log(`[BOT] Ate ${food.name} — Food: ${bot.food}`);
   } catch (e) {
     console.log('[BOT] Eat error:', e.message);
   } finally {
+    isWorking = false;
     setState(prevState === STATE.EATING ? STATE.IDLE : prevState);
   }
 }
 
 // ── HELPERS ──────────────────────────────────
+async function equipBestWeapon() {
+  const weapons = bot.inventory.items().filter(i => i.name.includes('sword') || i.name.includes('axe'));
+  if (weapons.length === 0) return;
+
+  // Simple sorting logic to prefer swords over axes, and higher tier over lower tier
+  weapons.sort((a, b) => {
+    const getScore = (name) => {
+      let score = 0;
+      if (name.includes('sword')) score += 10;
+      if (name.includes('axe'))   score += 5;
+      if (name.includes('diamond')) score += 40;
+      if (name.includes('iron'))    score += 30;
+      if (name.includes('stone'))   score += 20;
+      if (name.includes('wooden'))  score += 10;
+      return score;
+    };
+    return getScore(b.name) - getScore(a.name);
+  });
+
+  if (bot.heldItem?.name !== weapons[0].name) {
+    await bot.equip(weapons[0], 'hand');
+  }
+}
+
 function getNearestEntity(nameSet, maxDist) {
   return Object.values(bot.entities)
     .filter(e =>
@@ -426,13 +579,14 @@ function stopMovement() {
 }
 
 function setState(s) {
-  console.log(`[BOT] ${state} → ${s}`);
+  if (state !== s) console.log(`[BOT] ${state} → ${s}`);
   state = s;
 }
 
 function cleanup() {
   clearInterval(mainTick);
   clearInterval(lookTick);
+  isWorking = false;
   if (bot?.entity) stopMovement();
 }
 

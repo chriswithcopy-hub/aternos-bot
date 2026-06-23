@@ -89,19 +89,36 @@ function createBot() {
     mov.allowSprinting = true;
     bot.pathfinder.setMovements(mov);
     console.log('[BOT] Spawned');
-    setTimeout(() => { if (!registered) tryRegister(); }, 2000);
+    startAuthFlow();
   });
 
   bot.on('message', msg => {
     const m = msg.toString().toLowerCase();
     console.log('[SERVER]', m);
-    if (m.includes('register') && !m.includes('registered') && !registered) tryRegister();
-    if ((m.includes('login') || m.includes('log in')) && !registered) tryLogin();
-    if (!registered && (m.includes('successfully') || m.includes('logged in') ||
-        m.includes('welcome') || m.includes('registered'))) {
-      registered = true;
-      console.log('[BOT] Auth OK');
-      startAI();
+    if (registered) return;
+
+    // Server doesn't even recognize the command → no auth plugin installed, nothing to do.
+    if (m.includes('unknown or incomplete command') || m.includes('unknown command')) {
+      console.log('[AUTH] Server has no auth plugin — skipping registration');
+      resolveAuth();
+      return;
+    }
+
+    if (m.includes('already registered')) { attemptLogin(); return; }
+    if (m.includes('not registered') || m.includes('please register')) { attemptRegister(); return; }
+    if (m.includes('please login') || m.includes('please log in') ||
+        m.includes('you need to login') || m.includes('you need to log in')) {
+      attemptLogin();
+      return;
+    }
+    if (m.includes('successfully registered') || m.includes('registration successful')) {
+      // Some auth plugins still require a separate /login after registering.
+      setTimeout(() => { if (!registered) attemptLogin(); }, 1000);
+      return;
+    }
+    if (m.includes('successfully logged in') || m.includes('logged in successfully') ||
+        m.includes('login successful') || m.includes('welcome back')) {
+      resolveAuth();
     }
   });
 
@@ -112,16 +129,61 @@ function createBot() {
 }
 
 // ══════════════════════════════════════════
-// AUTH
+// AUTH — bounded attempts, cooldown between tries,
+// and a hard watchdog so the bot can never get stuck
+// spamming /register forever.
 // ══════════════════════════════════════════
-function tryRegister() {
-  console.log('[AUTH] /register');
-  bot.chat(`/register ${REG_PASSWORD} ${REG_PASSWORD}`);
-  setTimeout(() => { if (!registered) { registered = true; startAI(); } }, 5000);
+const MAX_AUTH_ATTEMPTS    = 2;     // total /register + /login attempts allowed
+const AUTH_RETRY_COOLDOWN  = 4000;  // ms — minimum gap between attempts
+const AUTH_WATCHDOG_MS     = 15000; // ms — give up waiting and just start AI
+
+let authAttempts  = 0;
+let lastAuthTry    = 0;
+let authWatchdog   = null;
+
+function startAuthFlow() {
+  authAttempts = 0;
+  lastAuthTry = 0;
+  clearTimeout(authWatchdog);
+
+  // Most AuthMe-style plugins expect /register right after join.
+  setTimeout(() => attemptRegister(), 1500);
+
+  // No matter what the server says (or doesn't say), never stay stuck here.
+  authWatchdog = setTimeout(() => {
+    if (!registered) {
+      console.log('[AUTH] Watchdog timeout — proceeding without confirmed auth');
+      resolveAuth();
+    }
+  }, AUTH_WATCHDOG_MS);
 }
-function tryLogin() {
-  console.log('[AUTH] /login');
+
+function canAttemptAuth() {
+  return !registered &&
+         authAttempts < MAX_AUTH_ATTEMPTS &&
+         (Date.now() - lastAuthTry) > AUTH_RETRY_COOLDOWN;
+}
+
+function attemptRegister() {
+  if (!canAttemptAuth()) return;
+  authAttempts++; lastAuthTry = Date.now();
+  console.log(`[AUTH] /register (attempt ${authAttempts}/${MAX_AUTH_ATTEMPTS})`);
+  bot.chat(`/register ${REG_PASSWORD} ${REG_PASSWORD}`);
+}
+
+function attemptLogin() {
+  if (!canAttemptAuth()) return;
+  authAttempts++; lastAuthTry = Date.now();
+  console.log(`[AUTH] /login (attempt ${authAttempts}/${MAX_AUTH_ATTEMPTS})`);
   bot.chat(`/login ${REG_PASSWORD}`);
+}
+
+function resolveAuth() {
+  if (registered) return;
+  registered = true;
+  clearTimeout(authWatchdog);
+  console.log('[BOT] Auth resolved — starting AI');
+  startAI();
 }
 
 // ══════════════════════════════════════════

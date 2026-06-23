@@ -1,4 +1,3 @@
-cat > /mnt/user-data/outputs/bot.js << 'ENDOFFILE'
 const mineflayer   = require('mineflayer');
 const { pathfinder, Movements, goals } = require('mineflayer-pathfinder');
 const { GoalNear } = goals;
